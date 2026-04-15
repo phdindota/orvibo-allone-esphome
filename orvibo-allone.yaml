@@ -1,0 +1,428 @@
+# ============================================================
+# Orvibo AllOne (WiWo-R1) — ESPHome Configuration
+# ============================================================
+#
+# First public ESPHome integration for the Orvibo AllOne
+# 433MHz RF hub. Si446x (SX716) transceiver fully initialized
+# from stock firmware config tables extracted via Ghidra.
+#
+# Hardware: US20RB V1.1 board
+# WiFi:     CW8266-02Z (ESP8266, 1MB flash)
+# RF:       Si446x (SX716) on SPI, 433.92MHz OOK
+# Stock FW: v3.0.5 (Sep 11 2018), model "VS20RB"
+#
+# NOTE: This unit was sold as an RF-only model for controlling
+# 433MHz blinds/curtains. It does NOT appear to have IR
+# hardware (no IR LED or IR receiver populated on the PCB).
+# Other AllOne variants (S20/S25) may include IR — those
+# would need GPIO3 (IR TX) and GPIO14 (IR RX) testing.
+#
+# Pin Map:
+#   GPIO0  = SPI CS (Si446x NSEL) — boot strapping pin!
+#   GPIO2  = SPI MOSI (Si446x SDI) — boot strapping pin!
+#   GPIO13 = SPI SCK (Si446x SCLK)
+#   GPIO15 = SPI MISO (Si446x SDO) — boot strapping pin!
+#   GPIO12 = Si446x Enable/Reset (SDN, active HIGH = shutdown)
+#   GPIO5  = Si446x GPIO0 (shared TX_DATA / RX_RAW_DATA)
+#   GPIO4  = Physical button (active LOW, internal pullup)
+#
+# ============================================================
+
+esphome:
+  name: orvibo-allone
+  friendly_name: Orvibo AllOne
+  # Include the Si446x driver header file.
+  # Must be in the same directory as this YAML.
+  includes:
+    - sx716_init.h
+
+# ESP8266 with 1MB flash (esp01_1m matches the CW8266-02Z module)
+esp8266:
+  board: esp01_1m
+
+# WiFi configuration
+# fast_connect + manual_ip helps with boot stability because
+# GPIO15 (MISO) is a boot strapping pin that the Si446x pulls,
+# and slow WiFi negotiation can cause boot loops.
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.50.181
+  fast_connect: true
+  manual_ip:
+    static_ip: 192.168.50.181
+    gateway: 192.168.50.1
+    subnet: 255.255.255.0
+    dns1: 192.168.50.39
+
+# Disable hardware UART logging — GPIO1 (TX) and GPIO3 (RX)
+# are not accessible on this board, and enabling UART logging
+# can interfere with boot.
+logger:
+  baud_rate: 0
+  level: DEBUG
+
+# Home Assistant API
+api:
+
+# OTA updates (first flash requires serial, then OTA works)
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# ============================================================
+# Si446x Auto-Init on Boot
+# ============================================================
+# GPIO0 (CS), GPIO2 (MOSI), and GPIO15 (MISO) are ESP8266
+# boot strapping pins. The Si446x pulls these during boot,
+# which can cause boot failures. Solution: delay init to 5s
+# after boot using an interval block, NOT on_boot.
+#
+# The init replays the complete Si446x configuration extracted
+# from the stock firmware: 56 CFG1 blocks (POWER_UP sequence),
+# frequency tuning, 26 CFG2 SET_PROPERTY packets (modem config,
+# channel filter, PA power, match registers).
+# ============================================================
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          // Run once — initialize Si446x via SPI
+          static bool init_done = false;
+          if (init_done) return;
+          init_done = true;
+          bool ok = sx716_init();
+          if (ok) { id(rf_ready) = true; }
+          else { init_done = false; }  // retry next interval
+
+# ============================================================
+# Globals
+# ============================================================
+globals:
+  # Stores the last learned RF code as a signed pulse array
+  # Positive values = HIGH duration (µs), negative = LOW duration
+  - id: learned_code
+    type: std::vector<int32_t>
+    restore_value: no
+
+  # True while waiting for a signal capture
+  - id: learning_mode
+    type: bool
+    initial_value: 'false'
+
+  # True after a signal has been successfully learned
+  - id: signal_learned
+    type: bool
+    initial_value: 'false'
+
+  # True after Si446x init completes successfully
+  - id: rf_ready
+    type: bool
+    initial_value: 'false'
+
+# ============================================================
+# RF Receiver — remote_receiver on GPIO5
+# ============================================================
+# The Si446x outputs RX_RAW_DATA (0x15) on GPIO0 → ESP GPIO5.
+# This is the raw demodulated OOK signal with NO hardware squelch —
+# noise is always present on this pin when RX is active.
+#
+# filter: 500us — Removes sub-500µs noise spikes but also
+#   destroys protocols with short pulses (<500µs like EV1527
+#   at 280µs). Protocols with ≥500µs pulses work fine.
+#   Lower values (200-250µs) crash the ESP8266 due to noise
+#   overwhelming the interrupt handler.
+#
+# idle: 50ms — Declares "signal done" after 50ms of silence.
+#   This captures multiple remote repeats in one burst.
+#
+# buffer_size: 5000b — Ring buffer for captured pulses.
+#   Holds ~2500 pulse values, more than enough for most signals.
+#
+# The on_raw callback:
+#   1. Ignores captures < 100 pulses (noise)
+#   2. Trims leading negative values (silence before signal)
+#   3. Quantizes pulse timings (clusters jitter into clean values)
+#   4. Logs the code as a copyable array for YAML hardcoding
+# ============================================================
+remote_receiver:
+  pin:
+    number: GPIO5
+    mode: INPUT
+    # allow_other_uses because remote_transmitter also uses GPIO5
+    allow_other_uses: true
+  tolerance: 50%
+  filter: 500us
+  idle: 50ms
+  buffer_size: 5000b
+  on_raw:
+    then:
+      - lambda: |-
+          // Only process during learning mode
+          if (!id(learning_mode)) return;
+
+          // Real signals are 100+ pulses; noise bursts are <50
+          if (x.size() < 100) return;
+
+          // Signal captured — stop RX and exit learning mode
+          id(learning_mode) = false;
+          sx716_stop_rx();
+
+          // Trim leading negatives (silence before signal start)
+          int start = 0;
+          while (start < (int)x.size() && x[start] <= 0) start++;
+
+          // Copy to learned_code global
+          id(learned_code).clear();
+          for (int i = start; i < (int)x.size(); i++)
+            id(learned_code).push_back(x[i]);
+
+          ESP_LOGI("rf", "Raw: %d pulses", id(learned_code).size());
+
+          // Quantize — cluster jittery timings into clean values
+          // This replicates what the stock Orvibo firmware does:
+          // it stores codes as [5000, -600, 280, -600, 600, -280]
+          // with perfectly clean timing, not the raw jittery captures.
+          rf_quantize(id(learned_code));
+
+          id(signal_learned) = true;
+
+          // Log the quantized code as a single copyable line
+          // Copy this array directly into a hardcoded button's code: field
+          std::string cs = "";
+          for (size_t i = 0; i < id(learned_code).size(); i++) {
+            if (i > 0) cs += ", ";
+            cs += std::to_string(id(learned_code)[i]);
+          }
+          ESP_LOGI("rf", "Quantized: %d pulses", id(learned_code).size());
+          ESP_LOGI("rf", "[%s]", cs.c_str());
+
+          // Publish preview to Home Assistant text sensor
+          std::string pv = "";
+          int c = 0;
+          for (int32_t v : id(learned_code)) {
+            if (c > 0) pv += ", ";
+            pv += std::to_string(v);
+            if (++c >= 20) { pv += "...(" + std::to_string(id(learned_code).size()) + ")"; break; }
+          }
+          id(last_signal).publish_state(pv.c_str());
+          id(learn_status).publish_state("Learned! " + std::to_string(id(learned_code).size()) + " pulses.");
+
+# ============================================================
+# RF Transmitter — remote_transmitter on GPIO5
+# ============================================================
+# Used for hardcoded TX buttons with hardware-timed pulses.
+# ESPHome's remote_transmitter generates precise pulse timing
+# using hardware interrupts — much more accurate than bit-bang.
+#
+# For hardcoded buttons:
+#   1. Call sx716_start_tx() to switch Si446x GPIO0 to TX_DATA
+#   2. Use remote_transmitter.transmit_raw with the code array
+#   3. Call sx716_stop_rx() to return to READY state
+#
+# NOTE: Dynamic codes via code: !lambda don't work on ESP8266
+# with the shared TX/RX pin — they fire instantly (0ms).
+# Use sx716_transmit_raw() bit-bang for dynamic replay instead.
+# ============================================================
+remote_transmitter:
+  id: rf_tx
+  pin:
+    number: GPIO5
+    # allow_other_uses because remote_receiver also uses GPIO5
+    allow_other_uses: true
+  carrier_duty_percent: 100%
+
+# ============================================================
+# Learning Mode Switch
+# ============================================================
+# Toggle that starts/stops RF learning. When turned ON:
+#   1. Initializes Si446x if not already done
+#   2. Puts Si446x in RX mode (GPIO5 = RX_RAW_DATA)
+#   3. Sets learning_mode flag — on_raw callback will capture
+# When turned OFF or after capture: stops Si446x RX.
+# ============================================================
+switch:
+  - platform: template
+    name: "Learning Mode"
+    id: learning_mode_switch
+    icon: "mdi:school"
+    lambda: 'return id(learning_mode);'
+    turn_on_action:
+      - lambda: |-
+          // Initialize Si446x if this is the first use
+          if (!id(rf_ready)) {
+            bool ok = sx716_init();
+            if (!ok) { id(learn_status).publish_state("Init FAILED!"); return; }
+            id(rf_ready) = true;
+          }
+          // Start Si446x RX — GPIO5 now outputs RX_RAW_DATA
+          sx716_start_rx();
+          id(learning_mode) = true;
+          id(learn_status).publish_state("Press remote now...");
+    turn_off_action:
+      - lambda: |-
+          id(learning_mode) = false;
+          sx716_stop_rx();
+          id(learn_status).publish_state("Cancelled.");
+
+# ============================================================
+# Buttons
+# ============================================================
+button:
+  # --- Learn Signal ---
+  # Shortcut that turns on the Learning Mode switch.
+  # Press this, then press your remote within a few seconds.
+  # The on_raw callback captures the signal automatically.
+  - platform: template
+    name: "Learn Signal"
+    icon: "mdi:record-rec"
+    on_press:
+      - switch.turn_on: learning_mode_switch
+
+  # --- Replay Learned Signal ---
+  # Transmits the last learned code using bit-bang TX.
+  # sx716_transmit_raw() uses noInterrupts() for timing accuracy,
+  # sends 5 repeats with 10ms gaps between each.
+  # The API may warn about slow operation (3-5s) — this is normal.
+  - platform: template
+    name: "Replay Learned Signal"
+    icon: "mdi:replay"
+    on_press:
+      - lambda: |-
+          if (!id(signal_learned) || id(learned_code).empty()) {
+            id(learn_status).publish_state("Nothing to replay!");
+            return;
+          }
+          id(learn_status).publish_state("TX...");
+          sx716_transmit_raw(id(learned_code), 5);
+          id(learn_status).publish_state("Sent!");
+
+  # --- Replay x3 ---
+  # Same as above but 15 repeats (3 × 5) for stubborn devices.
+  - platform: template
+    name: "Replay x3"
+    icon: "mdi:replay"
+    on_press:
+      - lambda: |-
+          if (!id(signal_learned) || id(learned_code).empty()) return;
+          id(learn_status).publish_state("TX x3...");
+          sx716_transmit_raw(id(learned_code), 15);
+          id(learn_status).publish_state("Done!");
+
+  # --- Clear Learned Signal ---
+  # Resets the learned code buffer and status.
+  - platform: template
+    name: "Clear Learned Signal"
+    icon: "mdi:delete"
+    on_press:
+      - lambda: |-
+          id(learned_code).clear();
+          id(signal_learned) = false;
+          id(last_signal).publish_state("(empty)");
+          id(learn_status).publish_state("Cleared.");
+
+  # ============================================================
+  # Hardcoded TX Buttons
+  # ============================================================
+  # These use remote_transmitter for hardware-timed pulse output.
+  # The codes below were captured with a CC1101 transceiver
+  # (which has hardware squelch for clean captures) and pasted here.
+  #
+  # To add your own:
+  #   1. Capture the code (Learn on Orvibo, or CC1101/RTL-SDR)
+  #   2. Copy the pulse array from the logs
+  #   3. Paste below following the template
+  #
+  # The sx716_start_tx() / sx716_stop_rx() calls switch the Si446x
+  # between TX_DATA mode (GPIO0 = 0x11) and READY state.
+  # ============================================================
+
+  - platform: template
+    name: "Fan Basement Breeze"
+    icon: mdi:fan
+    on_press:
+      # Switch Si446x to TX mode before transmitting
+      - lambda: sx716_start_tx();
+      - remote_transmitter.transmit_raw:
+          transmitter_id: rf_tx
+          carrier_frequency: 0Hz
+          # Code captured with CC1101 transceiver — 4 frames × ~72 pulses
+          # Protocol: ~300µs / ~900µs OOK with ~5100µs inter-frame gap
+          code: [928, -263, 355, -868, 302, -910, 864, -330, 328, -917, 874, -281, 287, -943, 888, -308, 235, -923, 889, -342, 887, -321, 264, -920, 314, -892, 292, -869, 356, -868, 342, -866, 289, -872, 897, -336, 337, -866, 287, -872, 951, -270, 331, -867, 357, -863, 313, -890, 286, -874, 371, -864, 313, -890, 938, -219, 990, -267, 320, -865, 316, -891, 318, -893, 264, -901, 316, -909, 310, -898, 907, -262, 951, -290, 325, -872, 315, -5054, 357, -880, 294, -902, 915, -293, 271, -918, 316, -871, 894, -312, 298, -901, 920, -264, 339, -882, 910, -280, 333, -880, 912, -269, 915, -292, 343, -846, 345, -867, 290, -872, 348, -891, 314, -890, 311, -894, 887, -297, 326, -865, 335, -866, 937, -292, 312, -870, 310, -921, 288, -897, 310, -900, 306, -897, 318, -883, 904, -278, 919, -276, 294, -935, 284, -900, 279, -922, 321, -872, 321, -885, 329, -869, 907, -277, 918, -289, 327, -866, 334, -5094, 313, -889, 312, -867, 910, -299, 325, -866, 336, -866, 936, -270, 324, -867, 911, -298, 323, -869, 909, -276, 344, -860, 916, -298, 901, -298, 324, -917, 289, -886, 315, -861, 331, -862, 333, -911, 290, -910, 892, -293, 309, -911, 290, -911, 890, -290, 334, -891, 266, -908, 316, -896, 286, -910, 286, -912, 313, -893, 937, -244, 903, -297, 351, -895, 293, -869, 328, -868, 330, -870, 331, -868, 330, -868, 931, -269, 898, -322, 338, -867, 290, -5103, 327, -869, 352, -867, 919, -247, 315, -894, 354, -865, 916, -247, 342, -867, 907, -288, 327, -866, 940, -340, 267, -895, 914, -270, 932, -318, 265, -900, 280, -922, 294, -898, 291, -921, 314, -911, 247, -917, 894, -317, 343, -860, 313, -869, 922, -287, 351, -871, 277, -897, 336, -895, 290, -879, 316, -869, 365, -873, 915, -242, 902, -297, 352, -893, 293, -868, 355, -866, 316, -868, 328, -867, 354, -892, 926, -244, 905, -297, 327, -915, 266, -5080, 320, -872, 373, -864, 940, -221, 338, -858, 385, -841, 945, -267, 336, -890, 923, -244, 301, -900, 911, -323, 259, -923, 893, -291, 921, -319, 248, -917, 319, -919, 267, -891, 323, -862, 356, -892, 279, -868, 924, -267, 392, -851, 292, -894, 888, -322, 337, -868, 290, -871, 375, -863, 289, -869, 352, -868, 353, -868, 939, -220]
+          repeat:
+            times: 3
+            wait_time: 0s
+      # Return Si446x to READY state after transmitting
+      - lambda: sx716_stop_rx();
+
+  # ============================================================
+  # Template for adding more hardcoded buttons
+  # ============================================================
+  # Copy this block, change the name/icon, paste your code array.
+  # Codes can come from:
+  #   - Learn Signal on this device (check ESPHome logs)
+  #   - CC1101 transceiver capture (best quality for short-pulse protocols)
+  #   - RTL-SDR + Universal Radio Hacker
+  #
+  # - platform: template
+  #     name: "My Device"
+  #     icon: mdi:remote
+  #     on_press:
+  #       - lambda: sx716_start_tx();
+  #       - remote_transmitter.transmit_raw:
+  #           transmitter_id: rf_tx
+  #           carrier_frequency: 0Hz
+  #           code: [PASTE_CODE_HERE]
+  #           repeat:
+  #             times: 10
+  #             wait_time: 0s
+  #       - lambda: sx716_stop_rx();
+
+# ============================================================
+# Status Sensors for Home Assistant
+# ============================================================
+text_sensor:
+  # Shows a preview of the last captured signal (first 20 values)
+  - platform: template
+    name: "Last Received Signal"
+    id: last_signal
+    icon: "mdi:signal"
+
+  # Shows current learning/replay status messages
+  - platform: template
+    name: "Learn Status"
+    id: learn_status
+    icon: "mdi:information"
+
+sensor:
+  # Number of pulses in the currently learned signal
+  - platform: template
+    name: "Learned Signal Length"
+    icon: "mdi:counter"
+    unit_of_measurement: "pulses"
+    lambda: 'return id(learned_code).size();'
+    update_interval: 5s
+
+  # WiFi signal strength for debugging connectivity
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  # Device uptime in seconds
+  - platform: uptime
+    name: "Uptime"
+
+binary_sensor:
+  # True when a signal has been learned and is ready for replay
+  - platform: template
+    name: "Signal Learned"
+    icon: "mdi:check-circle"
+    lambda: 'return id(signal_learned);'
+
+  # Physical button on the Orvibo AllOne board (GPIO4)
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Button"
