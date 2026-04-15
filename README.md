@@ -18,18 +18,6 @@ Si446x (SX716) RF transceiver fully reverse engineered from stock firmware v3.0.
 
 - **RF RX / Learn mode** — The Si446x `RX_RAW_DATA` output has **no hardware squelch**. GPIO5 outputs constant RF noise when in RX mode. ESPHome's `remote_receiver` captures noise mixed with signal, producing jittery, truncated, and often unusable codes. Replaying captured codes back does not reliably trigger target devices.
 
-### What was tried (and failed)
-
-| Approach | Result |
-|----------|--------|
-| `remote_receiver` with `filter: 500µs` | Stable but destroys protocols with <500µs pulses (most 433MHz remotes use 280µs). Captured codes too corrupted for replay. |
-| `remote_receiver` with `filter: 200-250µs` | Crashes the ESP8266 — noise floods the interrupt handler |
-| `RX_DATA` (0x14) instead of `RX_RAW_DATA` (0x15) | Worse — RX_DATA needs the packet handler's sync word detector |
-| GPIO ISR capture (`attachInterrupt`) | Si446x noise = 100k+ interrupts/sec → watchdog crash |
-| Tight polling loop with `yield()` | Starves WiFi stack → API disconnect → crash |
-| Frame comparison engine | Noise never produces consistent frames to compare |
-| Pulse quantization | Cleans up jitter but can't fix fundamentally corrupted captures |
-
 ### Where help is needed
 
 The stock Orvibo firmware **does** learn and replay RF codes successfully on this exact hardware. It uses a GPIO interrupt-based pulse capture approach (we found `pluseData`, `pluseNum`, `timeArray` strings in the firmware), but the exact algorithm hasn't been fully reverse engineered from the Xtensa assembly.
