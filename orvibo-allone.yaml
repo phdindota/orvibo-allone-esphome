@@ -1,0 +1,224 @@
+esphome:
+  name: orvibo-allone
+  friendly_name: Orvibo AllOne
+  includes:
+    - sx716_init.h
+
+esp8266:
+  board: esp01_1m
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.50.181
+  fast_connect: true
+  manual_ip:
+    static_ip: 192.168.50.181
+    gateway: 192.168.50.1
+    subnet: 255.255.255.0
+    dns1: 192.168.50.39
+
+logger:
+  baud_rate: 0
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          static bool init_done = false;
+          if (init_done) return;
+          init_done = true;
+          bool ok = sx716_init();
+          if (ok) { id(rf_ready) = true; }
+          else { init_done = false; }
+
+globals:
+  - id: learned_code
+    type: std::vector<int32_t>
+    restore_value: no
+  - id: learning_mode
+    type: bool
+    initial_value: 'false'
+  - id: signal_learned
+    type: bool
+    initial_value: 'false'
+  - id: rf_ready
+    type: bool
+    initial_value: 'false'
+
+remote_receiver:
+  pin:
+    number: GPIO5
+    mode: INPUT
+    allow_other_uses: true
+  tolerance: 50%
+  filter: 500us
+  idle: 50ms
+  buffer_size: 5000b
+  on_raw:
+    then:
+      - lambda: |-
+          if (!id(learning_mode)) return;
+          if (x.size() < 100) return;
+
+          id(learning_mode) = false;
+          sx716_stop_rx();
+
+          // Trim leading negatives
+          int start = 0;
+          while (start < (int)x.size() && x[start] <= 0) start++;
+
+          id(learned_code).clear();
+          for (int i = start; i < (int)x.size(); i++)
+            id(learned_code).push_back(x[i]);
+
+          ESP_LOGI("rf", "Raw: %d pulses", id(learned_code).size());
+
+          // Quantize — clean jitter like stock firmware
+          rf_quantize(id(learned_code));
+
+          id(signal_learned) = true;
+
+          // Log copyable code
+          std::string cs = "";
+          for (size_t i = 0; i < id(learned_code).size(); i++) {
+            if (i > 0) cs += ", ";
+            cs += std::to_string(id(learned_code)[i]);
+          }
+          ESP_LOGI("rf", "Quantized: %d pulses", id(learned_code).size());
+          ESP_LOGI("rf", "[%s]", cs.c_str());
+
+          std::string pv = "";
+          int c = 0;
+          for (int32_t v : id(learned_code)) {
+            if (c > 0) pv += ", ";
+            pv += std::to_string(v);
+            if (++c >= 20) { pv += "...(" + std::to_string(id(learned_code).size()) + ")"; break; }
+          }
+          id(last_signal).publish_state(pv.c_str());
+          id(learn_status).publish_state("Learned! " + std::to_string(id(learned_code).size()) + " pulses.");
+
+remote_transmitter:
+  id: rf_tx
+  pin:
+    number: GPIO5
+    allow_other_uses: true
+  carrier_duty_percent: 100%
+
+switch:
+  - platform: template
+    name: "Learning Mode"
+    id: learning_mode_switch
+    icon: "mdi:school"
+    lambda: 'return id(learning_mode);'
+    turn_on_action:
+      - lambda: |-
+          if (!id(rf_ready)) {
+            bool ok = sx716_init();
+            if (!ok) { id(learn_status).publish_state("Init FAILED!"); return; }
+            id(rf_ready) = true;
+          }
+          sx716_start_rx();
+          id(learning_mode) = true;
+          id(learn_status).publish_state("Press remote now...");
+    turn_off_action:
+      - lambda: |-
+          id(learning_mode) = false;
+          sx716_stop_rx();
+          id(learn_status).publish_state("Cancelled.");
+
+button:
+  - platform: template
+    name: "Learn Signal"
+    icon: "mdi:record-rec"
+    on_press:
+      - switch.turn_on: learning_mode_switch
+
+  - platform: template
+    name: "Replay Learned Signal"
+    icon: "mdi:replay"
+    on_press:
+      - lambda: |-
+          if (!id(signal_learned) || id(learned_code).empty()) {
+            id(learn_status).publish_state("Nothing to replay!");
+            return;
+          }
+          id(learn_status).publish_state("TX...");
+          sx716_transmit_raw(id(learned_code), 5);
+          id(learn_status).publish_state("Sent!");
+
+  - platform: template
+    name: "Replay x3"
+    icon: "mdi:replay"
+    on_press:
+      - lambda: |-
+          if (!id(signal_learned) || id(learned_code).empty()) return;
+          id(learn_status).publish_state("TX x3...");
+          sx716_transmit_raw(id(learned_code), 15);
+          id(learn_status).publish_state("Done!");
+
+  - platform: template
+    name: "Clear Learned Signal"
+    icon: "mdi:delete"
+    on_press:
+      - lambda: |-
+          id(learned_code).clear();
+          id(signal_learned) = false;
+          id(last_signal).publish_state("(empty)");
+          id(learn_status).publish_state("Cleared.");
+
+  - platform: template
+    name: "Fan Basement Breeze"
+    icon: mdi:fan
+    on_press:
+      - lambda: sx716_start_tx();
+      - remote_transmitter.transmit_raw:
+          transmitter_id: rf_tx
+          carrier_frequency: 0Hz
+          code: [928, -263, 355, -868, 302, -910, 864, -330, 328, -917, 874, -281, 287, -943, 888, -308, 235, -923, 889, -342, 887, -321, 264, -920, 314, -892, 292, -869, 356, -868, 342, -866, 289, -872, 897, -336, 337, -866, 287, -872, 951, -270, 331, -867, 357, -863, 313, -890, 286, -874, 371, -864, 313, -890, 938, -219, 990, -267, 320, -865, 316, -891, 318, -893, 264, -901, 316, -909, 310, -898, 907, -262, 951, -290, 325, -872, 315, -5054, 357, -880, 294, -902, 915, -293, 271, -918, 316, -871, 894, -312, 298, -901, 920, -264, 339, -882, 910, -280, 333, -880, 912, -269, 915, -292, 343, -846, 345, -867, 290, -872, 348, -891, 314, -890, 311, -894, 887, -297, 326, -865, 335, -866, 937, -292, 312, -870, 310, -921, 288, -897, 310, -900, 306, -897, 318, -883, 904, -278, 919, -276, 294, -935, 284, -900, 279, -922, 321, -872, 321, -885, 329, -869, 907, -277, 918, -289, 327, -866, 334, -5094, 313, -889, 312, -867, 910, -299, 325, -866, 336, -866, 936, -270, 324, -867, 911, -298, 323, -869, 909, -276, 344, -860, 916, -298, 901, -298, 324, -917, 289, -886, 315, -861, 331, -862, 333, -911, 290, -910, 892, -293, 309, -911, 290, -911, 890, -290, 334, -891, 266, -908, 316, -896, 286, -910, 286, -912, 313, -893, 937, -244, 903, -297, 351, -895, 293, -869, 328, -868, 330, -870, 331, -868, 330, -868, 931, -269, 898, -322, 338, -867, 290, -5103, 327, -869, 352, -867, 919, -247, 315, -894, 354, -865, 916, -247, 342, -867, 907, -288, 327, -866, 940, -340, 267, -895, 914, -270, 932, -318, 265, -900, 280, -922, 294, -898, 291, -921, 314, -911, 247, -917, 894, -317, 343, -860, 313, -869, 922, -287, 351, -871, 277, -897, 336, -895, 290, -879, 316, -869, 365, -873, 915, -242, 902, -297, 352, -893, 293, -868, 355, -866, 316, -868, 328, -867, 354, -892, 926, -244, 905, -297, 327, -915, 266, -5080, 320, -872, 373, -864, 940, -221, 338, -858, 385, -841, 945, -267, 336, -890, 923, -244, 301, -900, 911, -323, 259, -923, 893, -291, 921, -319, 248, -917, 319, -919, 267, -891, 323, -862, 356, -892, 279, -868, 924, -267, 392, -851, 292, -894, 888, -322, 337, -868, 290, -871, 375, -863, 289, -869, 352, -868, 353, -868, 939, -220]
+          repeat:
+            times: 3
+            wait_time: 0s
+      - lambda: sx716_stop_rx();
+
+text_sensor:
+  - platform: template
+    name: "Last Received Signal"
+    id: last_signal
+    icon: "mdi:signal"
+  - platform: template
+    name: "Learn Status"
+    id: learn_status
+    icon: "mdi:information"
+
+sensor:
+  - platform: template
+    name: "Learned Signal Length"
+    icon: "mdi:counter"
+    unit_of_measurement: "pulses"
+    lambda: 'return id(learned_code).size();'
+    update_interval: 5s
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+
+binary_sensor:
+  - platform: template
+    name: "Signal Learned"
+    icon: "mdi:check-circle"
+    lambda: 'return id(signal_learned);'
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Button"
