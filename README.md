@@ -18,7 +18,6 @@ Si446x (SX716) RF transceiver fully reverse engineered from stock firmware v3.0.
 
 - **RF RX / Learn mode** — The Si446x `RX_RAW_DATA` output has **no hardware squelch**. GPIO5 outputs constant RF noise when in RX mode. ESPHome's `remote_receiver` captures noise mixed with signal, producing jittery, truncated, and often unusable codes. Replaying captured codes back does not reliably trigger target devices.
 
-
 ### Where help is needed
 
 The stock Orvibo firmware **does** learn and replay RF codes successfully on this exact hardware. It uses a GPIO interrupt-based pulse capture approach (we found `pluseData`, `pluseNum`, `timeArray` strings in the firmware), but the exact algorithm hasn't been fully reverse engineered from the Xtensa assembly.
@@ -59,9 +58,6 @@ The stock Orvibo firmware **does** learn and replay RF codes successfully on thi
 | GPIO5 | TX/RX Data | GPIO0 | Shared: TX_DATA (0x11) or RX_RAW_DATA (0x15) |
 | GPIO4 | Physical button | — | Active LOW, internal pullup |
 
-### Board Photo
-
-![PCB Front](PCB_FRONT_ORVIBO.jpg)
 
 Key components:
 - **CW8266-02Z** — Blue shielded WiFi module (center top)
@@ -76,6 +72,7 @@ Key components:
 ## Flashing
 
 ### PRGM Header Pinout
+
 
 ```
 
