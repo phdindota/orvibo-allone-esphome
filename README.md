@@ -74,12 +74,6 @@ Key components:
 ### PRGM Header Pinout
 
 ```
-  PRGM Header (top view, labeled on silkscreen)
-  ┌─────────────────┐
-  │ 3U3  GP0  GND   │
-  │  TX  RST   RX   │
-  └─────────────────┘
-```
 
 | Pin | Function | Description |
 |-----|----------|-------------|
