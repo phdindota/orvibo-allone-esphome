@@ -70,9 +70,6 @@ The stock Orvibo firmware **does** learn and replay RF codes successfully on thi
 | GPIO5 | TX/RX Data | GPIO0 | Shared: TX_DATA (0x11) or RX_RAW_DATA (0x15) |
 | GPIO4 | Physical button | — | Active LOW, internal pullup |
 
-### Board Photo
-
-![PCB Front](PCB_FRONT_ORVIBO.jpg)
 
 Key components:
 - **CW8266-02Z** — Blue shielded WiFi module (center top)
@@ -88,12 +85,6 @@ Key components:
 
 ### PRGM Header Pinout
 
-```
-  PRGM Header (top view, labeled on silkscreen)
-  ┌─────────────────┐
-  │ 3U3  GP0  GND   │
-  │  TX  RST   RX   │
-  └─────────────────┘
 ```
 
 | Pin | Function | Description |
